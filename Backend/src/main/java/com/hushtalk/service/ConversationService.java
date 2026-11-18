@@ -21,6 +21,8 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.List;
+import com.hushtalk.dto.ConversationMemberResponse;
+import org.springframework.transaction.annotation.Transactional;
 
 @Service
 public class ConversationService {
@@ -40,6 +42,23 @@ public class ConversationService {
         this.userRepository = userRepository;
         this.membershipRepository = membershipRepository;
         this.cleanupRepository = cleanupRepository;
+    }
+    @Transactional(readOnly = true)
+    public List<ConversationMemberResponse> getConversationMembers(
+            Long conversationId,
+            Long userId
+    ) {
+
+        // Only existing conversation members can see the member list.
+        requireMembership(conversationId, userId);
+
+        return membershipRepository.findByConversationId(conversationId)
+                .stream()
+                .map(membership -> new ConversationMemberResponse(
+                        membership.getUser().getId(),
+                        membership.getUser().getUsername()
+                ))
+                .toList();
     }
 
     @Transactional

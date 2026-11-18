@@ -1,8 +1,9 @@
-
 package com.hushtalk.security;
 
 import com.hushtalk.repository.ConversationMembershipRepository;
+
 import io.jsonwebtoken.JwtException;
+
 import org.springframework.messaging.Message;
 import org.springframework.messaging.MessageChannel;
 import org.springframework.messaging.MessageDeliveryException;
@@ -24,15 +25,27 @@ public class JwtStompInterceptor implements ChannelInterceptor {
     private final JwtService jwtService;
     private final ConversationMembershipRepository membershipRepository;
 
-    private static final Pattern SEND_DESTINATION =
+    // Existing conversation SEND destinations.
+    private static final Pattern CONVERSATION_SEND_DESTINATION =
             Pattern.compile(
                     "^/app/conversations/(\\d+)/(messages|typing)$"
             );
 
-    private static final Pattern SUBSCRIBE_DESTINATION =
+    // Existing conversation SUBSCRIBE destinations.
+    private static final Pattern CONVERSATION_SUBSCRIBE_DESTINATION =
             Pattern.compile(
                     "^/topic/conversations/(\\d+)(?:/(typing|receipts|reactions))?$"
             );
+
+    // New call signaling SEND destinations.
+    private static final Pattern CALL_SEND_DESTINATION =
+            Pattern.compile(
+                    "^/app/calls/(?:initiate|[0-9a-fA-F-]{36}/(?:accept|reject|end|offer|answer|ice))$"
+            );
+
+    // New private call subscription.
+    private static final String CALL_SUBSCRIBE_DESTINATION =
+            "/user/queue/calls";
 
     public JwtStompInterceptor(
             JwtService jwtService,
@@ -47,6 +60,7 @@ public class JwtStompInterceptor implements ChannelInterceptor {
             Message<?> message,
             MessageChannel channel
     ) {
+
         StompHeaderAccessor accessor =
                 MessageHeaderAccessor.getAccessor(
                         message,
@@ -59,7 +73,10 @@ public class JwtStompInterceptor implements ChannelInterceptor {
 
         StompCommand command = accessor.getCommand();
 
-        // Authenticate the STOMP connection.
+        // =================================================
+        // 1. AUTHENTICATE STOMP CONNECTION
+        // =================================================
+
         if (StompCommand.CONNECT.equals(command)) {
 
             String authorizationHeader =
@@ -77,6 +94,7 @@ public class JwtStompInterceptor implements ChannelInterceptor {
             String token = authorizationHeader.substring(7);
 
             try {
+
                 Long userId = jwtService.extractUserId(token);
 
                 UsernamePasswordAuthenticationToken authentication =
@@ -99,56 +117,143 @@ public class JwtStompInterceptor implements ChannelInterceptor {
             return message;
         }
 
-        // Authorize SEND and SUBSCRIBE operations.
-        if (StompCommand.SEND.equals(command) ||
-                StompCommand.SUBSCRIBE.equals(command)) {
+        // =================================================
+        // 2. AUTHORIZE SEND AND SUBSCRIBE
+        // =================================================
 
-            Principal principal = accessor.getUser();
+        if (!StompCommand.SEND.equals(command) &&
+                !StompCommand.SUBSCRIBE.equals(command)) {
 
-            if (!(principal instanceof
-                    UsernamePasswordAuthenticationToken authentication)
-                    || !authentication.isAuthenticated()
-                    || !(authentication.getPrincipal() instanceof Long userId)) {
+            return message;
+        }
 
-                throw new MessageDeliveryException(
-                        message,
-                        "Unauthenticated STOMP operation"
-                );
+        // Verify authenticated user.
+        Principal principal = accessor.getUser();
+
+        if (!(principal instanceof
+                UsernamePasswordAuthenticationToken authentication)
+                || !authentication.isAuthenticated()
+                || !(authentication.getPrincipal() instanceof Long userId)) {
+
+            throw new MessageDeliveryException(
+                    message,
+                    "Unauthenticated STOMP operation"
+            );
+        }
+
+        String destination = accessor.getDestination();
+
+        if (destination == null) {
+
+            throw new MessageDeliveryException(
+                    message,
+                    "Missing STOMP destination"
+            );
+        }
+
+        // =================================================
+        // 3. AUTHORIZE CALL SIGNALING SEND
+        // =================================================
+
+        if (StompCommand.SEND.equals(command)) {
+
+            if (CALL_SEND_DESTINATION.matcher(destination).matches()) {
+
+                // Call participant and state validation happens
+                // inside CallSignalingService.
+                return message;
             }
 
-            String destination = accessor.getDestination();
+            // =================================================
+            // 4. AUTHORIZE EXISTING CONVERSATION SEND
+            // =================================================
 
-            Pattern pattern = StompCommand.SEND.equals(command)
-                    ? SEND_DESTINATION
-                    : SUBSCRIBE_DESTINATION;
+            Matcher matcher =
+                    CONVERSATION_SEND_DESTINATION.matcher(destination);
 
-            Matcher matcher = destination == null
-                    ? null
-                    : pattern.matcher(destination);
+            if (!matcher.matches()) {
 
-            if (matcher == null || !matcher.matches()) {
                 throw new MessageDeliveryException(
                         message,
                         "Unauthorized STOMP destination"
                 );
             }
 
-            Long conversationId = Long.parseLong(matcher.group(1));
+            Long conversationId =
+                    Long.parseLong(matcher.group(1));
 
-            boolean isMember = membershipRepository
-                    .existsByConversationIdAndUserId(
-                            conversationId,
-                            userId
-                    );
+            validateConversationMembership(
+                    message,
+                    conversationId,
+                    userId
+            );
 
-            if (!isMember) {
+            return message;
+        }
+
+        // =================================================
+        // 5. AUTHORIZE PRIVATE CALL SUBSCRIPTION
+        // =================================================
+
+        if (StompCommand.SUBSCRIBE.equals(command)) {
+
+            if (CALL_SUBSCRIBE_DESTINATION.equals(destination)) {
+
+                // Exact destination only.
+                // Spring resolves this to the authenticated user's queue.
+                return message;
+            }
+
+            // =================================================
+            // 6. AUTHORIZE EXISTING CONVERSATION SUBSCRIPTION
+            // =================================================
+
+            Matcher matcher =
+                    CONVERSATION_SUBSCRIBE_DESTINATION.matcher(destination);
+
+            if (!matcher.matches()) {
+
                 throw new MessageDeliveryException(
                         message,
-                        "You are not a member of this conversation"
+                        "Unauthorized STOMP destination"
                 );
             }
+
+            Long conversationId =
+                    Long.parseLong(matcher.group(1));
+
+            validateConversationMembership(
+                    message,
+                    conversationId,
+                    userId
+            );
         }
 
         return message;
+    }
+
+    // =====================================================
+    // 7. CONVERSATION MEMBERSHIP VALIDATION
+    // =====================================================
+
+    private void validateConversationMembership(
+            Message<?> message,
+            Long conversationId,
+            Long userId
+    ) {
+
+        boolean isMember = membershipRepository
+                .existsByConversationIdAndUserId(
+                        conversationId,
+                        userId
+                );
+
+        if (!isMember) {
+
+            throw new MessageDeliveryException(
+                    message,
+                    "You are not a member of this conversation"
+            );
+        }
     }
 }

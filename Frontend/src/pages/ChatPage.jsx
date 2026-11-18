@@ -20,6 +20,7 @@ import {
   addConversationMember,
   createConversation,
   fetchConversations,
+  fetchConversationMembers,
   fetchMessageHistory,
   fetchMessageReceipts,
   fetchMessageReactions,
@@ -31,6 +32,8 @@ import {
 } from "../api/chatApi";
 
 import useConversationSocket from "../hooks/useConversationSocket";
+import { useCallSocket } from "../hooks/useCallSocket";
+import useWebRTC from "../hooks/useWebRTC";
 
 import ConversationSidebar from "../components/chat/ConversationSidebar";
 import ChatHeader from "../components/chat/ChatHeader";
@@ -38,6 +41,7 @@ import MessageList from "../components/chat/MessageList";
 import MessageComposer from "../components/chat/MessageComposer";
 import CreateConversationModal from "../components/chat/CreateConversationModal";
 import Alert from "../components/ui/Alert";
+import CallDialog from "../components/chat/CallDialog";
 
 async function mapWithConcurrency(items, limit, mapper) {
   const results = new Array(items.length);
@@ -48,6 +52,7 @@ async function mapWithConcurrency(items, limit, mapper) {
     async () => {
       while (nextIndex < items.length) {
         const currentIndex = nextIndex++;
+
         results[currentIndex] = await mapper(
           items[currentIndex]
         );
@@ -109,14 +114,29 @@ export default function ChatPage() {
 
   const [typingUsers, setTypingUsers] = useState({});
 
+  // -----------------------------------------
+  // Phase 5: call state
+  // -----------------------------------------
+
+  const [conversationPeer, setConversationPeer] = useState(null);
+  const [membersLoading, setMembersLoading] = useState(false);
+
+  const [activeCall, setActiveCall] = useState(null);
+  const [callStarting, setCallStarting] = useState(false);
+  const [callError, setCallError] = useState("");
+  const [callNotice, setCallNotice] = useState("");
+
   const typingTimeoutsRef = useRef(new Map());
   const readMarkedRef = useRef(new Set());
   const deliveredMarkedRef = useRef(new Set());
   const typingActiveRef = useRef(false);
 
-  // --------------------
+  // Allows the signaling callback to reach the WebRTC hook.
+  const webRTCRef = useRef(null);
+
+  // -----------------------------------------
   // Receipt state helpers
-  // --------------------
+  // -----------------------------------------
 
   const updateReceipt = useCallback((receipt) => {
     setMessages((current) =>
@@ -164,9 +184,11 @@ export default function ChatPage() {
           deliveredMarkedRef.current.add(message.id);
 
           updateReceipt(receipt);
-
         } catch (error) {
-          console.error("Could not mark message as read:", error);
+          console.error(
+            "Could not mark message as read:",
+            error
+          );
         }
 
         return;
@@ -181,18 +203,21 @@ export default function ChatPage() {
         );
 
         deliveredMarkedRef.current.add(message.id);
-        updateReceipt(receipt);
 
+        updateReceipt(receipt);
       } catch (error) {
-        console.error("Could not mark message as delivered:", error);
+        console.error(
+          "Could not mark message as delivered:",
+          error
+        );
       }
     },
     [currentUserId, updateReceipt]
   );
 
-  // --------------------
+  // -----------------------------------------
   // Incoming messages
-  // --------------------
+  // -----------------------------------------
 
   const handleIncomingMessage = useCallback(
     (incoming) => {
@@ -212,9 +237,9 @@ export default function ChatPage() {
     [markIncomingMessage]
   );
 
-  // --------------------
+  // -----------------------------------------
   // Typing events
-  // --------------------
+  // -----------------------------------------
 
   const handleTyping = useCallback(
     (event) => {
@@ -234,7 +259,9 @@ export default function ChatPage() {
 
         setTypingUsers((current) => {
           const updated = { ...current };
+
           delete updated[userKey];
+
           return updated;
         });
 
@@ -249,7 +276,9 @@ export default function ChatPage() {
       const timer = setTimeout(() => {
         setTypingUsers((current) => {
           const updated = { ...current };
+
           delete updated[userKey];
+
           return updated;
         });
 
@@ -261,9 +290,9 @@ export default function ChatPage() {
     [currentUserId]
   );
 
-  // --------------------
+  // -----------------------------------------
   // Receipt events
-  // --------------------
+  // -----------------------------------------
 
   const handleReceipt = useCallback(
     (receipt) => {
@@ -272,9 +301,9 @@ export default function ChatPage() {
     [updateReceipt]
   );
 
-  // --------------------
+  // -----------------------------------------
   // Reaction events
-  // --------------------
+  // -----------------------------------------
 
   const handleReaction = useCallback((event) => {
     const reaction = event.reaction;
@@ -318,9 +347,104 @@ export default function ChatPage() {
     );
   }, []);
 
-  // --------------------
-  // WebSocket
-  // --------------------
+  // -----------------------------------------
+  // Call signaling events
+  // -----------------------------------------
+
+  const handleCallEvent = useCallback((event) => {
+    if (!event?.eventType) return;
+
+    setCallError("");
+
+    switch (event.eventType) {
+      case "INCOMING_CALL": {
+        setCallStarting(false);
+        setCallNotice("");
+
+        setActiveCall({
+          ...event,
+          direction: "INCOMING"
+        });
+
+        break;
+      }
+
+      case "CALL_RINGING": {
+        setCallStarting(false);
+        setCallNotice("");
+
+        setActiveCall({
+          ...event,
+          direction: "OUTGOING"
+        });
+
+        break;
+      }
+
+      case "CALL_ACCEPTED": {
+        setCallStarting(false);
+
+        // CALL_ACCEPTED is sent from the callee to the caller.
+        // Preserve the original caller/recipient IDs from CALL_RINGING.
+        setActiveCall((current) =>
+          current?.callId === event.callId
+            ? {
+                ...current,
+                status: "ACCEPTED"
+              }
+            : current
+        );
+
+        break;
+      }
+
+      case "CALL_REJECTED": {
+        setCallStarting(false);
+        setCallNotice(
+          "The other participant declined the call."
+        );
+
+        setActiveCall((current) =>
+          current?.callId === event.callId
+            ? null
+            : current
+        );
+
+        break;
+      }
+
+      case "CALL_ENDED": {
+        setCallStarting(false);
+        setCallNotice("The call has ended.");
+
+        setActiveCall((current) =>
+          current?.callId === event.callId
+            ? null
+            : current
+        );
+
+        break;
+      }
+
+      // WebRTC events are passed to useWebRTC.
+      case "WEBRTC_OFFER":
+      case "WEBRTC_ANSWER":
+      case "ICE_CANDIDATE": {
+        void webRTCRef.current?.handleSignalEvent(event);
+        break;
+      }
+
+      default:
+        console.warn(
+          "Unknown call signaling event:",
+          event.eventType
+        );
+    }
+  }, []);
+
+  // -----------------------------------------
+  // Existing conversation WebSocket
+  // -----------------------------------------
 
   const {
     connected,
@@ -336,9 +460,42 @@ export default function ChatPage() {
     onReaction: handleReaction
   });
 
-  // --------------------
+  // -----------------------------------------
+  // Separate global call signaling socket
+  // -----------------------------------------
+
+  const {
+    connected: callConnected,
+    socketError: callSocketError,
+    initiateCall,
+    acceptCall,
+    rejectCall,
+    endCall,
+    sendOffer,
+    sendAnswer,
+    sendIceCandidate
+  } = useCallSocket({
+    accessToken: auth.accessToken,
+    onCallEvent: handleCallEvent
+  });
+
+  // -----------------------------------------
+  // WebRTC hook
+  // -----------------------------------------
+
+  const webRTC = useWebRTC({
+    call: activeCall,
+    sendOffer,
+    sendAnswer,
+    sendIceCandidate
+  });
+
+  // Keep the latest handler available to STOMP events.
+  webRTCRef.current = webRTC;
+
+  // -----------------------------------------
   // Typing publisher
-  // --------------------
+  // -----------------------------------------
 
   const handleTypingChange = useCallback(
     (typing) => {
@@ -351,7 +508,10 @@ export default function ChatPage() {
       try {
         publishTyping(selected.id, typing);
       } catch (error) {
-        console.error("Typing event failed:", error);
+        console.error(
+          "Typing event failed:",
+          error
+        );
       }
     },
     [selected?.id, connected, publishTyping]
@@ -378,9 +538,219 @@ export default function ChatPage() {
     };
   }, []);
 
-  // --------------------
+  // -----------------------------------------
+  // Load the other participant for one-to-one calls
+  // -----------------------------------------
+
+  useEffect(() => {
+    let active = true;
+
+    setConversationPeer(null);
+    setMembersLoading(false);
+
+    if (!selected?.id) {
+      return undefined;
+    }
+
+    setMembersLoading(true);
+
+    async function loadConversationPeer() {
+      try {
+        const members = await fetchConversationMembers(
+          selected.id
+        );
+
+        if (!active) return;
+
+        if (
+          !Array.isArray(members) ||
+          members.length !== 2
+        ) {
+          setConversationPeer(null);
+          return;
+        }
+
+        const peer = members.find((member) => {
+          const memberId =
+            member.id ??
+            member.userId ??
+            member.user?.id;
+
+          return Number(memberId) !== Number(currentUserId);
+        });
+
+        if (!peer) {
+          setConversationPeer(null);
+          return;
+        }
+
+        const peerId =
+          peer.id ??
+          peer.userId ??
+          peer.user?.id;
+
+        setConversationPeer({
+          ...peer,
+          id: peerId,
+          username:
+            peer.username ??
+            peer.user?.username ??
+            `User ${peerId}`
+        });
+      } catch (error) {
+        if (active) {
+          setConversationPeer(null);
+
+          setCallError(
+            `Could not load conversation members: ${getErrorMessage(error)}`
+          );
+        }
+      } finally {
+        if (active) {
+          setMembersLoading(false);
+        }
+      }
+    }
+
+    loadConversationPeer();
+
+    return () => {
+      active = false;
+    };
+  }, [selected?.id, currentUserId]);
+
+  // -----------------------------------------
+  // Start an outgoing call
+  // -----------------------------------------
+
+  
+async function handleStartCall(callType) {
+  if (
+    !selected ||
+    !conversationPeer ||
+    !callConnected ||
+    activeCall ||
+    callStarting
+  ) {
+    return;
+  }
+
+  const normalizedCallType =
+    String(callType).toUpperCase();
+
+  if (!["AUDIO", "VIDEO"].includes(normalizedCallType)) {
+    setCallError("Unsupported call type.");
+    return;
+  }
+
+  setCallError("");
+  setCallNotice("");
+  setCallStarting(true);
+
+  try {
+    initiateCall(
+      selected.id,
+      conversationPeer.id,
+      normalizedCallType
+    );
+  } catch (error) {
+    setCallStarting(false);
+    setCallError(getErrorMessage(error));
+  }
+}
+
+
+  // -----------------------------------------
+  // Accept incoming call
+  // -----------------------------------------
+
+  async function handleAcceptCall() {
+    if (!activeCall?.callId) return;
+
+    setCallError("");
+
+    try {
+      acceptCall(activeCall.callId);
+
+      // The callee needs local ACCEPTED state so that
+      // useWebRTC can request microphone access.
+      // The callee waits for WEBRTC_OFFER from the caller.
+      setActiveCall((current) =>
+        current?.callId === activeCall.callId
+          ? {
+              ...current,
+              status: "ACCEPTED"
+            }
+          : current
+      );
+    } catch (error) {
+      setCallError(getErrorMessage(error));
+    }
+  }
+
+  // -----------------------------------------
+  // Reject incoming call
+  // -----------------------------------------
+
+  function handleRejectCall() {
+    if (!activeCall?.callId) return;
+
+    setCallError("");
+
+    try {
+      rejectCall(activeCall.callId);
+
+      setActiveCall(null);
+      setCallNotice("Call declined.");
+    } catch (error) {
+      setCallError(getErrorMessage(error));
+    }
+  }
+
+  // -----------------------------------------
+  // End active call
+  // -----------------------------------------
+
+  function handleEndCall() {
+    if (!activeCall?.callId) return;
+
+    setCallError("");
+
+    try {
+      endCall(activeCall.callId);
+
+      setActiveCall(null);
+      setCallNotice("Call ended.");
+    } catch (error) {
+      setCallError(getErrorMessage(error));
+    }
+  }
+
+  // -----------------------------------------
+  // Call button state
+  // -----------------------------------------
+
+  const canCall = Boolean(
+    selected &&
+    conversationPeer &&
+    callConnected &&
+    !activeCall &&
+    !callStarting
+  );
+
+  const callDisabledReason = membersLoading
+    ? "Loading conversation members"
+    : !conversationPeer
+      ? "Calls currently support one-to-one conversations only"
+      : !callConnected
+        ? "Call signaling is disconnected"
+        : activeCall || callStarting
+          ? "You already have an active call"
+          : "Start a call";
+
+  // -----------------------------------------
   // Initial data
-  // --------------------
+  // -----------------------------------------
 
   useEffect(() => {
     let active = true;
@@ -399,12 +769,10 @@ export default function ChatPage() {
           setConversations(conversationData);
           setUsers(userData);
         }
-
       } catch (error) {
         if (active) {
           setPageError(getErrorMessage(error));
         }
-
       } finally {
         if (active) {
           setLoading(false);
@@ -419,10 +787,9 @@ export default function ChatPage() {
     };
   }, []);
 
-  // --------------------
-  // Message history and
-  // historical reactions/receipts
-  // --------------------
+  // -----------------------------------------
+  // Message history and historical reactions/receipts
+  // -----------------------------------------
 
   useEffect(() => {
     let active = true;
@@ -434,11 +801,15 @@ export default function ChatPage() {
     readMarkedRef.current.clear();
     deliveredMarkedRef.current.clear();
 
-    if (!selected) return undefined;
+    if (!selected) {
+      return undefined;
+    }
 
     async function loadHistory() {
       try {
-        const history = await fetchMessageHistory(selected.id);
+        const history = await fetchMessageHistory(
+          selected.id
+        );
 
         // Backend returns newest first.
         const orderedHistory = [...history].reverse();
@@ -486,7 +857,6 @@ export default function ChatPage() {
             );
           }
         }
-
       } catch (error) {
         if (active) {
           setPageError(getErrorMessage(error));
@@ -505,10 +875,9 @@ export default function ChatPage() {
     markIncomingMessage
   ]);
 
-  // --------------------
-  // Mark messages read
-  // when the tab becomes visible
-  // --------------------
+  // -----------------------------------------
+  // Mark messages read when tab becomes visible
+  // -----------------------------------------
 
   useEffect(() => {
     if (!selected) return undefined;
@@ -545,9 +914,9 @@ export default function ChatPage() {
     markIncomingMessage
   ]);
 
-  // --------------------
+  // -----------------------------------------
   // Conversation actions
-  // --------------------
+  // -----------------------------------------
 
   async function refreshConversations(preferredId) {
     const data = await fetchConversations();
@@ -556,10 +925,13 @@ export default function ChatPage() {
 
     if (preferredId) {
       const item = data.find(
-        (conversation) => conversation.id === preferredId
+        (conversation) =>
+          conversation.id === preferredId
       );
 
-      if (item) setSelected(item);
+      if (item) {
+        setSelected(item);
+      }
     }
   }
 
@@ -588,18 +960,16 @@ export default function ChatPage() {
       setModalOpen(false);
 
       await refreshConversations(created.id);
-
     } catch (error) {
       setPageError(getErrorMessage(error));
-
     } finally {
       setCreating(false);
     }
   }
 
-  // --------------------
+  // -----------------------------------------
   // Send message / reply
-  // --------------------
+  // -----------------------------------------
 
   function handleSendMessage(event) {
     event.preventDefault();
@@ -618,15 +988,14 @@ export default function ChatPage() {
       setReplyingTo(null);
 
       handleTypingChange(false);
-
     } catch (error) {
       setPageError(error.message);
     }
   }
 
-  // --------------------
+  // -----------------------------------------
   // Reactions
-  // --------------------
+  // -----------------------------------------
 
   async function handleToggleReaction(message, type) {
     if (!selected) return;
@@ -658,7 +1027,6 @@ export default function ChatPage() {
                 }
           )
         );
-
       } else {
         const created = await addMessageReaction(
           selected.id,
@@ -686,15 +1054,14 @@ export default function ChatPage() {
           )
         );
       }
-
     } catch (error) {
       setPageError(getErrorMessage(error));
     }
   }
 
-  // --------------------
+  // -----------------------------------------
   // Display helpers
-  // --------------------
+  // -----------------------------------------
 
   const senderName = (senderId) => {
     const user = users.find(
@@ -710,10 +1077,15 @@ export default function ChatPage() {
     .map(Number)
     .map(senderName);
 
+  // -----------------------------------------
+  // Render
+  // -----------------------------------------
+
   return (
     <div className="min-h-screen bg-slate-100 p-0 text-ink md:p-5">
       <div className="mx-auto flex h-screen max-h-[920px] max-w-[1440px] overflow-hidden bg-white shadow-panel md:rounded-3xl md:border md:border-slate-200">
 
+        {/* Conversation sidebar */}
         <div
           className={`${
             selected ? "hidden md:flex" : "flex"
@@ -731,6 +1103,7 @@ export default function ChatPage() {
           />
         </div>
 
+        {/* Main chat area */}
         <main
           className={`${
             selected ? "flex" : "hidden md:flex"
@@ -748,11 +1121,33 @@ export default function ChatPage() {
                 conversation={selected}
                 connected={connected}
                 onBack={() => setSelected(null)}
+                canCall={canCall}
+                callDisabledReason={callDisabledReason}
+                onStartCall={handleStartCall}
+                callStarting={callStarting}
               />
 
               {socketError && (
                 <div className="mx-5 mt-3">
                   <Alert>{socketError}</Alert>
+                </div>
+              )}
+
+              {callSocketError && (
+                <div className="mx-5 mt-3">
+                  <Alert>{callSocketError}</Alert>
+                </div>
+              )}
+
+              {callError && (
+                <div className="mx-5 mt-3">
+                  <Alert>{callError}</Alert>
+                </div>
+              )}
+
+              {callNotice && (
+                <div className="mx-5 mt-3 rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm text-slate-600">
+                  {callNotice}
                 </div>
               )}
 
@@ -811,6 +1206,47 @@ export default function ChatPage() {
         </main>
       </div>
 
+      {/* Global call dialog: visible even without a selected chat */}
+      
+<CallDialog
+  call={activeCall}
+  participantName={
+    activeCall
+      ? (
+          users.find((user) =>
+            Number(user.id) === Number(
+              activeCall.direction === "INCOMING"
+                ? activeCall.fromUserId
+                : activeCall.toUserId
+            )
+          )?.username ||
+          (
+            activeCall.direction === "INCOMING"
+              ? "HushTalk user"
+              : conversationPeer?.username || "HushTalk user"
+          )
+        )
+      : ""
+  }
+  onAccept={handleAcceptCall}
+  onReject={handleRejectCall}
+  onEnd={handleEndCall}
+
+  localStream={webRTC.localStream}
+  remoteStream={webRTC.remoteStream}
+
+  connectionState={webRTC.connectionState}
+  mediaError={webRTC.mediaError}
+
+  isMuted={webRTC.isMuted}
+  isCameraOn={webRTC.isCameraOn}
+
+  onToggleMute={webRTC.toggleMute}
+  onToggleCamera={webRTC.toggleCamera}
+/>
+
+
+      {/* Create conversation modal */}
       <CreateConversationModal
         open={modalOpen}
         onClose={() => setModalOpen(false)}

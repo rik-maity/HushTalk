@@ -118,3 +118,11 @@ export async function removeMessageReaction(
     }
   );
 }
+
+export async function fetchConversationMembers(conversationId) {
+  const { data } = await api.get(
+    `/api/v1/conversations/${conversationId}/members`
+  );
+
+  return data;
+}

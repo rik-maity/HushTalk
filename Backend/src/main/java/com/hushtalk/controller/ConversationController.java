@@ -12,6 +12,7 @@ import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
+import com.hushtalk.dto.ConversationMemberResponse;
 
 @RestController
 @RequestMapping("/api/v1/conversations")
@@ -37,6 +38,14 @@ public class ConversationController {
             @AuthenticationPrincipal Long userId
     ) {
         return conversationService.getAllConversations(userId);
+    }
+
+    @GetMapping("/{id}/members")
+    public List<ConversationMemberResponse> getConversationMembers(
+            @PathVariable Long id,
+            @AuthenticationPrincipal Long userId
+    ) {
+        return conversationService.getConversationMembers(id, userId);
     }
 
     @GetMapping("/{id}")
