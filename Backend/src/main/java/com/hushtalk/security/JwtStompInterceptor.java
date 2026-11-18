@@ -71,6 +71,7 @@ public class JwtStompInterceptor implements ChannelInterceptor {
             return message;
         }
 
+
         StompCommand command = accessor.getCommand();
 
         // =================================================
@@ -142,6 +143,11 @@ public class JwtStompInterceptor implements ChannelInterceptor {
         }
 
         String destination = accessor.getDestination();
+
+        if (StompCommand.SUBSCRIBE.equals(command)
+                && "/user/queue/inbox".equals(destination)) {
+            return message;
+        }
 
         if (destination == null) {
 

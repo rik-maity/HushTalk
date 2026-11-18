@@ -6,7 +6,7 @@ import {
   useRef,
   useState
 } from "react";
-
+import useInboxSocket from "../hooks/useinboxSocket";
 import { MessageCircle } from "lucide-react";
 
 import { useAuth } from "../context/AuthContext";
@@ -169,7 +169,7 @@ export default function ChatPage() {
 
   const markIncomingMessage = useCallback(
     async (message, conversationId, shouldRead) => {
-      if (message.senderId === currentUserId) return;
+      if (Number(message.senderId) === Number(currentUserId)) return;
 
       if (shouldRead) {
         if (readMarkedRef.current.has(message.id)) return;
@@ -538,6 +538,79 @@ export default function ChatPage() {
     };
   }, []);
 
+  //------------------------------------------
+  // Global inbox WebSocket (for notifications of new conversations)
+  //------------------------------------------
+// -----------------------------------------
+// Global inbox WebSocket
+// -----------------------------------------
+
+// -----------------------------------------
+// Global inbox message handler
+// -----------------------------------------
+
+const handleInboxMessage = useCallback(
+  (incoming) => {
+    if (!incoming?.id || !incoming?.conversationId) return;
+
+    const conversationId = Number(incoming.conversationId);
+
+    const isOwnMessage =
+      Number(incoming.senderId) === Number(currentUserId);
+
+    const isOpenAndVisible =
+      Number(selected?.id) === conversationId &&
+      document.visibilityState === "visible";
+
+    setConversations((current) => {
+      const existing = current.find(
+        (item) => Number(item.id) === conversationId
+      );
+
+      // Ignore events for conversations not present in the inbox.
+      if (!existing) return current;
+
+      const updatedConversation = {
+        ...existing,
+        lastMessage: incoming,
+        unreadCount:
+          isOwnMessage || isOpenAndVisible
+            ? Number(existing.unreadCount || 0)
+            : Number(existing.unreadCount || 0) + 1
+      };
+
+      // Move the conversation with the newest message to the top.
+      return [
+        updatedConversation,
+        ...current.filter(
+          (item) => Number(item.id) !== conversationId
+        )
+      ];
+    });
+
+    // Mark incoming messages as delivered.
+    // The conversation socket handles READ when appropriate.
+  if (
+  !isOwnMessage &&
+  Number(selected?.id) !== conversationId
+) {
+  void markIncomingMessage(
+    incoming,
+    conversationId,
+    false
+  );
+}
+  },
+  [currentUserId, selected?.id, markIncomingMessage]
+);
+
+const {
+  connected: inboxConnected,
+  socketError: inboxSocketError
+} = useInboxSocket({
+  accessToken: auth.accessToken,
+  onInboxMessage: handleInboxMessage
+});
   // -----------------------------------------
   // Load the other participant for one-to-one calls
   // -----------------------------------------
@@ -748,6 +821,22 @@ async function handleStartCall(callType) {
           ? "You already have an active call"
           : "Start a call";
 
+
+  // -----------------------------------------
+// Select conversation and clear unread count
+// -----------------------------------------
+
+const handleSelectConversation = useCallback((conversation) => {
+  setSelected(conversation);
+
+  setConversations((current) =>
+    current.map((item) =>
+      Number(item.id) === Number(conversation.id)
+        ? { ...item, unreadCount: 0 }
+        : item
+    )
+  );
+}, []);
   // -----------------------------------------
   // Initial data
   // -----------------------------------------
@@ -766,9 +855,15 @@ async function handleStartCall(callType) {
         ]);
 
         if (active) {
-          setConversations(conversationData);
-          setUsers(userData);
-        }
+  setConversations(
+    conversationData.map((conversation) => ({
+      ...conversation,
+      unreadCount: Number(conversation.unreadCount || 0)
+    }))
+  );
+
+  setUsers(userData);
+}
       } catch (error) {
         if (active) {
           setPageError(getErrorMessage(error));
@@ -885,6 +980,14 @@ async function handleStartCall(callType) {
     function handleVisibilityChange() {
       if (document.visibilityState !== "visible") return;
 
+      setConversations((current) =>
+  current.map((conversation) =>
+    Number(conversation.id) === Number(selected.id)
+      ? { ...conversation, unreadCount: 0 }
+      : conversation
+  )
+);
+
       messages.forEach((message) => {
         if (message.senderId !== currentUserId) {
           void markIncomingMessage(
@@ -919,21 +1022,36 @@ async function handleStartCall(callType) {
   // -----------------------------------------
 
   async function refreshConversations(preferredId) {
-    const data = await fetchConversations();
+  const data = await fetchConversations();
 
-    setConversations(data);
-
-    if (preferredId) {
-      const item = data.find(
-        (conversation) =>
-          conversation.id === preferredId
+  setConversations((current) =>
+    data.map((conversation) => {
+      const existing = current.find(
+        (item) => Number(item.id) === Number(conversation.id)
       );
 
-      if (item) {
-        setSelected(item);
-      }
+      return {
+        ...conversation,
+        unreadCount: Number(
+          existing?.unreadCount ??
+          conversation.unreadCount ??
+          0
+        )
+      };
+    })
+  );
+
+  if (preferredId) {
+    const item = data.find(
+      (conversation) =>
+        Number(conversation.id) === Number(preferredId)
+    );
+
+    if (item) {
+      setSelected(item);
     }
   }
+}
 
   async function handleCreateConversation(event) {
     event.preventDefault();
@@ -1094,7 +1212,7 @@ async function handleStartCall(callType) {
           <ConversationSidebar
             conversations={conversations}
             selectedId={selected?.id}
-            onSelect={setSelected}
+            onSelect={handleSelectConversation}
             onCreate={() => setModalOpen(true)}
             onLogout={logout}
             search={search}
@@ -1114,6 +1232,12 @@ async function handleStartCall(callType) {
               <Alert>{pageError}</Alert>
             </div>
           )}
+
+          {inboxSocketError && (
+  <div className="mx-4 mt-2">
+    <Alert>{inboxSocketError}</Alert>
+  </div>
+)}
 
           {selected ? (
             <>
